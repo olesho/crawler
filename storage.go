@@ -10,8 +10,6 @@ import (
 
 type MysqlStorage struct {
 	db *gorm.DB
-
-	list []string
 }
 
 type MysqlConfig struct {
@@ -49,7 +47,6 @@ func NewMysqlStorage(conf *MysqlConfig) (*MysqlStorage, error) {
 	db.AutoMigrate(&GormRecord{})
 	return &MysqlStorage{
 		db,
-		make([]string, 0),
 	}, nil
 }
 
@@ -74,37 +71,41 @@ func (s *MysqlStorage) RemoveTask(id int64) error {
 }
 
 func (s *MysqlStorage) ListTasks(uid int64) ([]*Task, error) {
-	tasks := make([]*Task, 0)
-	err := s.db.Where("UserId = ?", uid).Find(&tasks).Error
-	return tasks, err
+	tasks := make([]*GormTask, 0)
+	err := s.db.Where("user_id = ?", uid).Find(&tasks).Error
+	result := make([]*Task, len(tasks))
+	for i, _ := range tasks {
+		result[i] = &tasks[i].Task
+		result[i].id = int64(tasks[i].ID)
+	}
+ 	return result, err
 }
 
 func (s *MysqlStorage) AddRecord(r *Record) error {
-	s.list = append(s.list, r.Url)
 	return s.db.Create(fromRecord(r)).Error
 }
 
-func (s *MysqlStorage) ListRecords(taskId int64) ([]*Record, error) {
-	tasks := make([]*Record, 0)
-	err := s.db.Where("TaskId = ?", taskId).Find(&tasks).Error
-	return tasks, err
+func (s *MysqlStorage) SetRecordChecked(url string) error {
+	return s.db.Model(&GormRecord{}).Where("url = ?", url).Update("checked", true).Error
+}
+
+func (s *MysqlStorage) ListUncheckedRecords(taskId int64) ([]*Record, error) {
+	tasks := make([]*GormRecord, 0)
+	err := s.db.Where("task_id = ?", taskId).Find(&tasks, "checked = ?", false).Error
+	results := make([]*Record, len(tasks))
+	for i, _ := range tasks {
+		results[i] = &tasks[i].Record
+	}
+	return results, err
 }
 
 func (s *MysqlStorage) Exists(url string, maxTimeStamp *time.Time) (bool, error) {
-	for _, u := range s.list {
-		if u == url {
-			return true, nil
-		}
-	}
-	return false, nil
-
-
 	var r GormRecord
 	var err error
 	if maxTimeStamp != nil {
-		err = s.db.First(&r, "createdAt >= ?", time.Time{}).Error
+		err = s.db.First(&r, "createdAt >= ? AND url = ? AND checked = ?", time.Time{}, url, false).Error
 	} else {
-		err = s.db.First(&r).Error
+		err = s.db.First(&r, "url = ? AND checked = ?", url, false).Error
 	}
 	if err != nil {
 		if err == gorm.ErrRecordNotFound {

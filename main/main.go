@@ -24,17 +24,23 @@ func main() {
 		panic(err)
 	}
 
-	t, err := c.Task(0, "https://bbc.co.uk/news/", `^https:\/\/bbc.co.uk\/news\/`)
-	if err != nil {
-		panic(err)
+	availableTasks := c.Tasks()
+	var taskId int64
+	if len(availableTasks) > 0 {
+		taskId = availableTasks[0].GetID()
+	} else {
+		taskId, err = c.Task(0, "https://bbc.co.uk/news/", `^https:\/\/bbc.co.uk\/news\/`)
+		if err != nil {
+			panic(err)
+		}
 	}
 
-	c.Run(t)
+	c.Run(taskId)
 	time.Sleep(time.Second*30)
 }
 
 type receiver struct {}
 
-func (r *receiver) Receive(url string, taskId int64) {
-	fmt.Println(url)
+func (r *receiver) Receive(url string, taskId int64, data []byte) {
+	fmt.Println(url, string(data[:100]))
 }
