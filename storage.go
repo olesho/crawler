@@ -10,6 +10,8 @@ import (
 
 type MysqlStorage struct {
 	db *gorm.DB
+
+	list []string
 }
 
 type MysqlConfig struct {
@@ -47,6 +49,7 @@ func NewMysqlStorage(conf *MysqlConfig) (*MysqlStorage, error) {
 	db.AutoMigrate(&GormRecord{})
 	return &MysqlStorage{
 		db,
+		make([]string, 0),
 	}, nil
 }
 
@@ -77,6 +80,7 @@ func (s *MysqlStorage) ListTasks(uid int64) ([]*Task, error) {
 }
 
 func (s *MysqlStorage) AddRecord(r *Record) error {
+	s.list = append(s.list, r.Url)
 	return s.db.Create(fromRecord(r)).Error
 }
 
@@ -87,6 +91,14 @@ func (s *MysqlStorage) ListRecords(taskId int64) ([]*Record, error) {
 }
 
 func (s *MysqlStorage) Exists(url string, maxTimeStamp *time.Time) (bool, error) {
+	for _, u := range s.list {
+		if u == url {
+			return true, nil
+		}
+	}
+	return false, nil
+
+
 	var r GormRecord
 	var err error
 	if maxTimeStamp != nil {
@@ -98,6 +110,7 @@ func (s *MysqlStorage) Exists(url string, maxTimeStamp *time.Time) (bool, error)
 		if err == gorm.ErrRecordNotFound {
 			return false, nil
 		}
+		return false, err
 	}
 	return true, err
 }
