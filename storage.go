@@ -44,7 +44,7 @@ func NewMysqlStorage(conf *MysqlConfig) (*MysqlStorage, error) {
 		return nil, err
 	}
 	db.AutoMigrate(&GormTask{})
-	db.AutoMigrate(&GormRecord{})
+	db.AutoMigrate(&GormRecord{}).AddUniqueIndex("unique_url", "url")
 	return &MysqlStorage{
 		db,
 	}, nil
@@ -99,19 +99,25 @@ func (s *MysqlStorage) ListUncheckedRecords(taskId int64) ([]*Record, error) {
 	return results, err
 }
 
-func (s *MysqlStorage) Exists(url string, maxTimeStamp *time.Time) (bool, error) {
+func (s *MysqlStorage) GetRecord(url string, maxTimeStamp *time.Time) (*Record, error) {
 	var r GormRecord
-	var err error
 	if maxTimeStamp != nil {
-		err = s.db.First(&r, "createdAt >= ? AND url = ? AND checked = ?", time.Time{}, url, false).Error
-	} else {
-		err = s.db.First(&r, "url = ? AND checked = ?", url, false).Error
+		err := s.db.First(&r, "createdAt >= ? AND url = ?", time.Time{}, url).Error
+		if err == gorm.ErrRecordNotFound {
+			return nil, nil
+		}
+		if err != nil {
+			return nil, err
+		}
+		return &r.Record, err
+	}
+
+	err := s.db.First(&r, "url = ? ", url).Error
+	if err == gorm.ErrRecordNotFound {
+		return nil, nil
 	}
 	if err != nil {
-		if err == gorm.ErrRecordNotFound {
-			return false, nil
-		}
-		return false, err
+		return nil, err
 	}
-	return true, err
+	return &r.Record, err
 }

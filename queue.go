@@ -2,14 +2,18 @@ package crawler
 
 import (
 	"net/http"
-	"io/ioutil"
-	"io"
 	"github.com/pkg/errors"
+	"io/ioutil"
+	"compress/gzip"
+	"io"
+	"sync/atomic"
 )
 
 type HttpQueue struct {
 	data chan request
-	receiver func(url string, data io.ReadCloser, id int64, err error)
+	receiver Receiver
+	headers map[string]string
+	processed int32
 }
 
 type request struct {
@@ -17,10 +21,10 @@ type request struct {
 	id int64
 }
 
-func NewHttqQueue(maxConns int, receiver func(url string, data io.ReadCloser, id int64, err error)) *HttpQueue {
+func NewHttqQueue(maxConns int, headers map[string]string) *HttpQueue {//, receiver func(url string, data io.ReadCloser, id int64, err error)) *HttpQueue {
 	q := &HttpQueue{
 		data: make(chan request),
-		receiver: receiver,
+		headers: headers,
 	}
 
 	for i := 0; i < maxConns; i++ {
@@ -37,36 +41,60 @@ func (q *HttpQueue) Put(url string, id int64) {
 	q.data <- request{url, id}
 }
 
-func (q *HttpQueue) get(r request) {
-	resp, err := http.Get(r.url)
-	if err != nil {
-		q.receiver(r.url, nil, r.id, err)
-		return
-	}
-	if resp != nil {
-		q.receiver(r.url, resp.Body, r.id, nil)
-		return
-	}
-	q.receiver(r.url, nil, r.id, errors.New("Unable to finish request"))
+func (q* HttpQueue) SetReceiver(r Receiver) {
+	q.receiver = r
 }
 
-func Get(url string) (urls []string, err error) {
-	//fmt.Printf("Getting %v ... ", url)
-	r, err := http.Get(url)
-	defer r.Body.Close()
-	if err != nil {
-		return nil, err
-	}
-	b, err := ioutil.ReadAll(r.Body)
-	if err != nil {
-		return nil, err
-	}
-	res := hrefRegex.FindAllSubmatch(b, -1)
-	urls = make([]string, len(res))
-	for i, r := range res {
-		urls[i] = string(r[1])
-	}
-	//fmt.Println("done")
-	//fmt.Println(urls)
-	return
+func (q* HttpQueue) Done() bool{
+	return len(q.data) == 0 && q.processed == 0
 }
+
+func (q *HttpQueue) get(r request) {
+	atomic.AddInt32(&q.processed, 1)
+	q.processed++
+
+	netTransport := &http.Transport{
+		DisableCompression: true,
+	}
+
+	client := &http.Client{
+		Transport: netTransport,
+	}
+
+	req, err := http.NewRequest("GET", r.url, nil)
+	if err != nil {
+		q.receiver.Receive(r.url, r.id, nil, err)
+	}
+
+	for k, v := range q.headers {
+		req.Header.Set(k, v)
+	}
+
+	resp, err := client.Do(req)
+	if err != nil {
+		q.receiver.Receive(r.url, r.id, nil, err)
+		atomic.AddInt32(&q.processed, -1)
+		return
+	}
+
+	if resp != nil {
+		defer resp.Body.Close()
+
+		var reader io.ReadCloser
+		switch resp.Header.Get("Content-Encoding") {
+		case "gzip":
+			reader, err = gzip.NewReader(resp.Body)
+			defer reader.Close()
+		default:
+			reader = resp.Body
+		}
+
+		b, _ := ioutil.ReadAll(reader)
+		q.receiver.Receive(r.url, r.id, b,nil)
+		atomic.AddInt32(&q.processed, -1)
+		return
+	}
+	q.receiver.Receive(r.url, r.id, nil, errors.New("Unable to finish request"))
+	atomic.AddInt32(&q.processed, -1)
+}
+

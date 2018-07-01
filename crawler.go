@@ -1,12 +1,10 @@
 package crawler
 
 import (
-	"time"
 	"regexp"
 	"log"
-	"io"
-	"io/ioutil"
 	"net/url"
+	"time"
 )
 
 type Record struct {
@@ -21,6 +19,7 @@ type Task struct {
 	Url string
 	RegexpRule string
 	regexpCompiled *regexp.Regexp
+	filter func(url string) bool
 
 	UrlScheme string
 	UrlHost string
@@ -56,11 +55,11 @@ type Storage interface {
 	AddRecord(*Record) error
 	SetRecordChecked(url string) error
 	ListUncheckedRecords(taskId int64) ([]*Record, error)
-	Exists(url string, maxTimeStamp *time.Time) (bool, error)
+	GetRecord(url string, t *time.Time) (*Record, error)
 }
 
 type Receiver interface {
-	Receive(url string, taskId int64, data []byte)
+	Receive(url string, taskId int64, data []byte, err error) bool
 }
 
 type Crawler struct {
@@ -68,9 +67,10 @@ type Crawler struct {
 	receiver Receiver
 	queue *HttpQueue
 	tasks []*Task
+	done chan struct{}
 }
 
-func New(s Storage, receiver Receiver) (*Crawler, error) {
+func New(s Storage, receiver Receiver, queue *HttpQueue) (*Crawler, error) {
 	tasks, err := s.ListTasks(0)
 	if err != nil {
 		return nil, err
@@ -87,9 +87,15 @@ func New(s Storage, receiver Receiver) (*Crawler, error) {
 		storage: s,
 		receiver: receiver,
 		tasks: tasks,
+		done: make(chan struct{}),
 	}
-	c.queue = NewHttqQueue(2, c.rcv)
+	c.queue = queue
+	c.queue.SetReceiver(c)
 	return c, nil
+}
+
+func (c *Crawler) Done() chan struct{} {
+	return c.done
 }
 
 func (c *Crawler) Task(UserId int64, Url, RegexpRule string) (int64, error) {
@@ -102,6 +108,10 @@ func (c *Crawler) Task(UserId int64, Url, RegexpRule string) (int64, error) {
 
 	var err error
 	t.id, err = c.storage.AddTask(t)
+
+	t.filter = func(url string) bool {
+		return t.regexpCompiled.MatchString(url)
+	}
 
 	c.tasks = append(c.tasks, t)
 	return t.id, err
@@ -132,43 +142,30 @@ func (c *Crawler) run(taskId int64) {
 		if err != nil {
 			log.Printf("Unable to list unchecked records: %v", err)
 		}
+		if len(recs) == 0 {
+			c.done <- struct{}{}
+		}
 		for _, r := range recs {
 			go c.queue.Put(r.Url, taskId)
 		}
 	}
 }
 
-func (c *Crawler) rcv(Url string, data io.ReadCloser, id int64, err error) {
-	if err != nil {
-		log.Printf("Failed to get url: %v. Error: %v", Url, err)
-		return
-	}
-	defer data.Close()
+func (c *Crawler) SetFilterFunc(taskId int64, f func(url string) bool) {
+	c.getTask(taskId).filter = f
+}
 
-	/*
-	err = c.storage.AddRecord(&Record{
-		TaskId: id,
-		Url: Url,
-		Checked: true,
-	})
-	*/
-	err = c.storage.SetRecordChecked(Url)
-	if err != nil {
-		log.Printf("Error saving record: %v", err)
-		return
+func (c *Crawler) Receive(Url string, id int64, data []byte, requestErr error) bool {
+	if requestErr != nil {
+		log.Printf("Failed to get url: %v. Error: %v", Url, requestErr)
+		return false
 	}
 
-	b, err := ioutil.ReadAll(data)
-	if err != nil {
-		log.Printf("Failed to read data. Url: %v. Error: %v", Url, err)
-		return
-	}
-	res := hrefRegex.FindAllSubmatch(b, -1)
+	res := hrefRegex.FindAllSubmatch(data, -1)
 	urls := make([]string, len(res))
 	for i, r := range res {
 		urls[i] = string(r[1])
 	}
-	c.receiver.Receive(Url, id, b)
 
 	t := c.getTask(id)
 	for _, u := range urls {
@@ -179,28 +176,49 @@ func (c *Crawler) rcv(Url string, data io.ReadCloser, id int64, err error) {
 		if parsed.Scheme == "" {
 			parsed.Scheme = t.UrlScheme
 		}
-		if t.regexpCompiled.MatchString(parsed.String()) {
-			c.processUrl(parsed.String(), id)
+		//if t.regexpCompiled.MatchString(parsed.String()) {
+			if t.filter(parsed.String()) {
+				c.processUrl(parsed.String(), id)
+			}
+
+		//}
+	}
+	if c.receiver.Receive(Url, id, data, requestErr) {
+		err := c.storage.SetRecordChecked(Url)
+		if err != nil {
+			log.Printf("Error saving record: %v", err)
+			return false
 		}
 	}
+	if c.queue.Done() {
+		c.done <- struct{}{}
+	}
+	return true
 }
 
 func (c *Crawler) processUrl(Url string, taskId int64) {
-	exists, err := c.storage.Exists(Url, nil)
-	if err != nil {
-		log.Printf("Error checking url existence: %v", err)
+	r, _:= c.storage.GetRecord(Url, nil)
+
+	if r != nil {
+		if r.Checked {
+			return
+		}
+		go c.queue.Put(Url, taskId)
 		return
 	}
 
-	if !exists {
-		err = c.storage.AddRecord(&Record{
+	if r == nil {
+		err := c.storage.AddRecord(&Record{
 			TaskId: taskId,
 			Url: Url,
 			Checked: false,
 		})
-		go c.queue.Put(Url, taskId)
+		if err != nil {
+			log.Printf("Unable to add record: %v", err)
+		}
 	}
+	go c.queue.Put(Url, taskId)
 }
 
 
-var hrefRegex *regexp.Regexp = regexp.MustCompile(`\shref=[\'"]?([^\'" >]+)`)
+var hrefRegex *regexp.Regexp = regexp.MustCompile(`\shref=[\'"]?([^\'">]+)`)
